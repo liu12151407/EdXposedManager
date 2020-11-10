@@ -1,14 +1,23 @@
 package org.meowcat.edxposed.manager.xposed;
 
+import android.app.Application;
+import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.os.Binder;
 import android.os.Build;
 import android.os.FileObserver;
+import android.os.Process;
 import android.os.StrictMode;
 import android.os.UserHandle;
+import android.util.Log;
 import android.util.SparseArray;
 
+import androidx.annotation.Keep;
+import androidx.annotation.Nullable;
+
+import org.json.JSONObject;
+import org.meowcat.edxposed.manager.MeowCatApplication;
 import org.meowcat.edxposed.manager.StatusInstallerFragment;
 
 import java.io.BufferedReader;
@@ -20,8 +29,6 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
-import androidx.annotation.Keep;
-import androidx.annotation.Nullable;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XC_MethodReplacement;
@@ -40,6 +47,7 @@ public class Enhancement implements IXposedHookLoadPackage {
 
     private static final String mPretendXposedInstallerFlag = "pretend_xposed_installer";
     private static final String mHideEdXposedManagerFlag = "hide_edxposed_manager";
+    private static final String mDisableForceClientSafetyNetFlag = "disable_force_client_safetynet";
 
     private static final String LEGACY_INSTALLER = "de.robv.android.xposed.installer";
 
@@ -54,7 +62,7 @@ public class Enhancement implements IXposedHookLoadPackage {
             "com.android.permissioncontroller", // For permissions grant
             "com.topjohnwu.magisk", // For superuser root grant
             "eu.chainfire.supersu"
-    ); // UserHandle.isCore(uid) will auto pass
+    ); // isUidBelongSystemCoreComponent(uid) will auto pass
 
     private static final SparseArray<List<String>> modulesList = new SparseArray<>();
     private static final SparseArray<FileObserver> modulesListObservers = new SparseArray<>();
@@ -105,7 +113,7 @@ public class Enhancement implements IXposedHookLoadPackage {
     }
 
     private static List<String> readModulesList(final String filename) {
-        XposedBridge.log("EdXpMgrEx: Reading modules list " + filename + "...");
+        Log.d(MeowCatApplication.TAG, "Reading modules list " + filename + "...");
         final StrictMode.ThreadPolicy oldPolicy = StrictMode.allowThreadDiskReads();
         try {
             final File listFile = new File(filename);
@@ -120,7 +128,7 @@ public class Enhancement implements IXposedHookLoadPackage {
                 bufferedReader.close();
                 fileReader.close();
             } catch (IOException e) {
-                XposedBridge.log(e);
+                Log.e(MeowCatApplication.TAG, "Read modules list error:", e);
             }
             Collections.sort(list);
             return list;
@@ -133,14 +141,37 @@ public class Enhancement implements IXposedHookLoadPackage {
         try {
             final Class<?> hookClass = XposedHelpers.findClassIfExists(className, classLoader);
             if (hookClass == null || XposedBridge.hookAllMethods(hookClass, methodName, callback).size() == 0)
-                XposedBridge.log("Failed to hook " + methodName + " method in " + className);
+                Log.w(MeowCatApplication.TAG, "Failed to hook " + methodName + " method in " + className);
         } catch (Throwable t) {
-            XposedBridge.log(t);
+            Log.e(MeowCatApplication.TAG, "Failed to hook " + methodName + " method in " + className + ":", t);
         }
     }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+
+        findAndHookMethod(Application.class, "attach", Context.class, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam applicationParam) {
+                XposedHelpers.findAndHookMethod(JSONObject.class, "getBoolean", String.class, new XC_MethodHook() {
+                    public void beforeHookedMethod(MethodHookParam param) {
+                        String str = (String) param.args[0];
+                        Context context = (Context) applicationParam.args[0];
+                        ApplicationInfo applicationInfo = context.getApplicationInfo();
+                        if (applicationInfo != null) {
+                            int userId = UserHandle.getUserHandleForUid(applicationInfo.uid).hashCode();
+                            if (getFlagState(userId, mDisableForceClientSafetyNetFlag)) {
+                                return;
+                            }
+                        }
+                        if (("ctsProfileMatch".equals(str) || "basicIntegrity".equals(str) || "isValidSignature".equals(str))) {
+                            param.setResult(true);
+                        }
+                    }
+                });
+            }
+        });
+
         if (lpparam.packageName.equals("android")) {
             // com.android.server.pm.PackageManagerService.getInstalledApplications(int flag, int userId)
             findAndHookMethod("com.android.server.pm.PackageManagerService", lpparam.classLoader, "getInstalledApplications", int.class, int.class, new XC_MethodHook() {
@@ -148,7 +179,7 @@ public class Enhancement implements IXposedHookLoadPackage {
                 protected void afterHookedMethod(MethodHookParam param) {
                     if (param.args != null && param.args[0] != null) {
                         final int packageUid = Binder.getCallingUid();
-                        if ((boolean) callStaticMethod(UserHandle.class, "isCore", packageUid)) {
+                        if (isUidBelongSystemCoreComponent(packageUid)) {
                             return;
                         }
 
@@ -199,7 +230,7 @@ public class Enhancement implements IXposedHookLoadPackage {
                 protected void afterHookedMethod(MethodHookParam param) {
                     if (param.args != null && param.args[0] != null) {
                         final int packageUid = Binder.getCallingUid();
-                        if ((boolean) callStaticMethod(UserHandle.class, "isCore", packageUid)) {
+                        if (isUidBelongSystemCoreComponent(packageUid)) {
                             return;
                         }
 
@@ -250,7 +281,7 @@ public class Enhancement implements IXposedHookLoadPackage {
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (param.args != null && param.args[0] != null) {
                         final int packageUid = Binder.getCallingUid();
-                        if ((boolean) callStaticMethod(UserHandle.class, "isCore", packageUid)) {
+                        if (isUidBelongSystemCoreComponent(packageUid)) {
                             return;
                         }
 
@@ -292,7 +323,7 @@ public class Enhancement implements IXposedHookLoadPackage {
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (param.args != null && param.args[0] != null) {
                         final int packageUid = Binder.getCallingUid();
-                        if ((boolean) callStaticMethod(UserHandle.class, "isCore", packageUid)) {
+                        if (isUidBelongSystemCoreComponent(packageUid)) {
                             return;
                         }
 
@@ -351,4 +382,12 @@ public class Enhancement implements IXposedHookLoadPackage {
         }
     }
 
+    private boolean isUidBelongSystemCoreComponent(int uid){
+        if (uid >= 0) {
+            final int appId = (int)callStaticMethod(UserHandle.class, "getAppId", uid);
+            return appId < Process.FIRST_APPLICATION_UID;
+        } else {
+            return false;
+        }
+    }
 }
